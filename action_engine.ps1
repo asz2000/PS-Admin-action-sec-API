@@ -9,7 +9,7 @@ Set-StrictMode -Version Latest
 # ==========================
 
 $script:EngineRoot = Split-Path -Parent $PSScriptRoot
-$script:StateDir   = Join-Path $script:EngineRoot "state"
+$script:StateDir   = 'C:\AccountActions\store\actions'
 $script:LogDir     = Join-Path $script:EngineRoot "logs"
 $script:AllowListFile = Join-Path $script:EngineRoot "allowlist.json"
 
@@ -98,7 +98,109 @@ function Test-AllowListAction {
 function Get-ActionStatePath {
     param([string] $ActionId)
 
-    return Join-Path $script:StateDir "$ActionId.json"
+    $guid = [guid]::Empty
+    if (-not [guid]::TryParse($ActionId, [ref]$guid)) {
+        throw "ActionId must be a valid GUID: $ActionId"
+    }
+
+    return Join-Path $script:StateDir ("action-{0}.json" -f $guid.ToString())
+}
+
+function ConvertTo-ActionSchema {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [hashtable] $Action,
+        [Parameter()] [hashtable] $ExistingAction
+    )
+
+    if (-not $Action.Id) {
+        throw 'Action.Id is required'
+    }
+
+    $utcNow = [DateTime]::UtcNow.ToString('o')
+
+    $target = @{}
+    if ($ExistingAction -and $ExistingAction.Target -is [hashtable]) {
+        $target = [hashtable]$ExistingAction.Target.Clone()
+    }
+    if ($Action.Target -is [hashtable]) {
+        foreach ($key in $Action.Target.Keys) {
+            $target[$key] = $Action.Target[$key]
+        }
+    }
+
+    $responsible = @{}
+    if ($ExistingAction -and $ExistingAction.Responsible -is [hashtable]) {
+        $responsible = [hashtable]$ExistingAction.Responsible.Clone()
+    }
+    if ($Action.Responsible -is [hashtable]) {
+        foreach ($key in $Action.Responsible.Keys) {
+            $responsible[$key] = $Action.Responsible[$key]
+        }
+    }
+
+    $meta = @{}
+    if ($ExistingAction -and $ExistingAction.Meta -is [hashtable]) {
+        $meta = [hashtable]$ExistingAction.Meta.Clone()
+    }
+    if ($Action.Meta -is [hashtable]) {
+        foreach ($key in $Action.Meta.Keys) {
+            $meta[$key] = $Action.Meta[$key]
+        }
+    }
+    if ($Action.Parameters -ne $null -and -not $meta.ContainsKey('Parameters')) {
+        $meta.Parameters = $Action.Parameters
+    }
+
+    $audit = @{}
+    if ($ExistingAction -and $ExistingAction.Audit -is [hashtable]) {
+        $audit = [hashtable]$ExistingAction.Audit.Clone()
+    }
+    if ($Action.Audit -is [hashtable]) {
+        foreach ($key in $Action.Audit.Keys) {
+            $audit[$key] = $Action.Audit[$key]
+        }
+    }
+
+    if (-not $audit.ContainsKey('History') -or $audit.History -eq $null) {
+        $audit.History = @()
+    }
+
+    if (-not $audit.ContainsKey('CreatedAt') -or [string]::IsNullOrWhiteSpace([string]$audit.CreatedAt)) {
+        $audit.CreatedAt = if ($Action.CreatedAt) { $Action.CreatedAt } elseif ($ExistingAction) { $ExistingAction.CreatedAt } else { $utcNow }
+    }
+
+    $status = if ($Action.Status) { $Action.Status } elseif ($ExistingAction) { $ExistingAction.Status } else { 'PENDING' }
+    $existingStatus = if ($ExistingAction) { $ExistingAction.Status } else { $null }
+
+    if (-not $existingStatus -or $existingStatus -ne $status) {
+        $history = @($audit.History)
+        $history += @{
+            Timestamp = $utcNow
+            Status = $status
+        }
+        $audit.History = $history
+    }
+
+    $audit.UpdatedAt = $utcNow
+
+    return [ordered]@{
+        Id = [string]$Action.Id
+        ActionType = if ($Action.ActionType) { $Action.ActionType } elseif ($ExistingAction) { $ExistingAction.ActionType } else { $null }
+        Target = $target
+        Responsible = $responsible
+        TokenHash = if ($Action.TokenHash) { $Action.TokenHash } elseif ($ExistingAction) { $ExistingAction.TokenHash } else { $null }
+        TokenPurpose = if ($Action.TokenPurpose) { $Action.TokenPurpose } elseif ($ExistingAction) { $ExistingAction.TokenPurpose } else { 'ACTION_CONFIRMATION' }
+        Status = $status
+        CreatedAt = if ($Action.CreatedAt) { $Action.CreatedAt } elseif ($ExistingAction) { $ExistingAction.CreatedAt } else { $utcNow }
+        ConfirmedAt = if ($Action.ContainsKey('ConfirmedAt')) { $Action.ConfirmedAt } elseif ($ExistingAction) { $ExistingAction.ConfirmedAt } else { $null }
+        ExecutedAt = if ($Action.ContainsKey('ExecutedAt')) { $Action.ExecutedAt } elseif ($ExistingAction) { $ExistingAction.ExecutedAt } else { $null }
+        FinishedAt = if ($Action.ContainsKey('FinishedAt')) { $Action.FinishedAt } elseif ($ExistingAction) { $ExistingAction.FinishedAt } else { $null }
+        ExpiresAt = if ($Action.ExpiresAt) { $Action.ExpiresAt } elseif ($ExistingAction) { $ExistingAction.ExpiresAt } else { $null }
+        Result = if ($Action.ContainsKey('Result')) { $Action.Result } elseif ($ExistingAction) { $ExistingAction.Result } else { $null }
+        Meta = $meta
+        Audit = $audit
+    }
 }
 
 function Save-Action {
@@ -107,15 +209,17 @@ function Save-Action {
         [Parameter(Mandatory)] [hashtable] $Action
     )
 
-    if (-not $Action.Id) {
-        throw "Action.Id is required"
+    $existing = $null
+    $path = Get-ActionStatePath -ActionId $Action.Id
+    if (Test-Path $path) {
+        $existing = Get-Content -Path $path -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 15 | ConvertFrom-Json -AsHashtable
     }
 
-    $path = Get-ActionStatePath -ActionId $Action.Id
-    $json = $Action | ConvertTo-Json -Depth 10
+    $normalized = ConvertTo-ActionSchema -Action $Action -ExistingAction $existing
+    $json = $normalized | ConvertTo-Json -Depth 15
     Write-AtomicFile -Path $path -Content $json
 
-    return $Action
+    return $normalized
 }
 
 function Get-ActionById {
@@ -130,12 +234,13 @@ function Get-ActionById {
     }
 
     $raw = Get-Content -Path $path -Raw | ConvertFrom-Json
-    $json = $raw | ConvertTo-Json -Depth 10
-    return ConvertFrom-Json -InputObject $json -AsHashtable
+    $json = $raw | ConvertTo-Json -Depth 15
+    $action = ConvertFrom-Json -InputObject $json -AsHashtable
+    return ConvertTo-ActionSchema -Action $action
 }
 
 function Get-AllActionPaths {
-    Get-ChildItem -Path $script:StateDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+    Get-ChildItem -Path $script:StateDir -Filter 'action-*.json' -File -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty FullName
 }
 
@@ -218,6 +323,7 @@ function New-AccountAction {
         ExecutedAt = $null
         FinishedAt = $null
         ExpiresAt = $utcNow.AddMinutes($TokenTtlMinutes).ToString('o')
+        TokenPurpose = 'ACTION_CONFIRMATION'
         Target = @{
             SamAccountName = $SamAccountName
             DisplayName = $DisplayName
@@ -228,10 +334,13 @@ function New-AccountAction {
         }
         Meta = @{
             Reason = $Reason
+            Parameters = $Parameters
         }
-        Parameters = $Parameters
         Result = $null
-        Error = $null
+        Audit = @{
+            CreatedBy = $ResponsibleEmail
+            UpdatedBy = $ResponsibleEmail
+        }
     }
 
     Save-Action -Action $action | Out-Null
@@ -262,7 +371,7 @@ function Get-AccountActionByToken {
     $utcNow = [DateTime]::UtcNow
 
     foreach ($path in Get-AllActionPaths) {
-        $action = Get-Content -Path $path -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+        $action = Get-Content -Path $path -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 15 | ConvertFrom-Json -AsHashtable
         if (-not $action.TokenHash) {
             continue
         }
@@ -336,8 +445,8 @@ function Invoke-AccountAction {
     $allowed = Test-AllowListAction -ActionName $action.ActionType
 
     $execParams = @{}
-    if ($action.Parameters -is [hashtable]) {
-        $execParams = $action.Parameters
+    if ($action.Meta -is [hashtable] -and $action.Meta.Parameters -is [hashtable]) {
+        $execParams = $action.Meta.Parameters
     }
 
     if (-not $execParams.ContainsKey('SamAccountName')) {
@@ -350,7 +459,9 @@ function Invoke-AccountAction {
         $action.Status = 'EXECUTED'
         $action.ExecutedAt = [DateTime]::UtcNow.ToString('o')
         $action.Result = $result
-        $action.Error = $null
+        if ($action.Audit -is [hashtable]) {
+            $action.Audit.UpdatedBy = 'Invoke-AccountAction'
+        }
     }
     catch {
         $action.Status = 'FAILED'
@@ -358,8 +469,13 @@ function Invoke-AccountAction {
         $action.Result = @{
             Message = $_.Exception.Message
         }
-        $action.Error = $_.Exception.Message
-        Write-EngineLog -Level 'ERROR' -Message 'Account action execution failed' -Context @{ id = $ActionId; error = $action.Error }
+        if ($action.Meta -is [hashtable]) {
+            $action.Meta.LastError = $_.Exception.Message
+        }
+        if ($action.Audit -is [hashtable]) {
+            $action.Audit.UpdatedBy = 'Invoke-AccountAction'
+        }
+        Write-EngineLog -Level 'ERROR' -Message 'Account action execution failed' -Context @{ id = $ActionId; error = $_.Exception.Message }
     }
     finally {
         $action.FinishedAt = [DateTime]::UtcNow.ToString('o')
