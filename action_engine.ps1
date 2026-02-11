@@ -12,6 +12,7 @@ $script:EngineRoot = Split-Path -Parent $PSScriptRoot
 $script:StateDir   = 'C:\AccountActions\store\actions'
 $script:LogDir     = Join-Path $script:EngineRoot "logs"
 $script:AllowListFile = Join-Path $script:EngineRoot "allowlist.json"
+$script:AllowedScriptsDir = Join-Path $script:EngineRoot "scripts"
 
 # Ensure directories exist
 foreach ($dir in @($script:StateDir, $script:LogDir)) {
@@ -89,7 +90,68 @@ function Test-AllowListAction {
         throw "Action '$ActionName' is not allowed by allowlist"
     }
 
+    if ($match.PSObject.Properties.Name -contains 'script' -and -not [string]::IsNullOrWhiteSpace([string]$match.script)) {
+        throw "Action '$ActionName' contains a forbidden inline script definition. Use Path to a .ps1 file."
+    }
+
     return $match
+}
+
+function Test-PathWithinBaseDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $BaseDirectory
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $fullBase = [System.IO.Path]::GetFullPath($BaseDirectory)
+
+    if (-not $fullBase.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+        $fullBase = '{0}{1}' -f $fullBase, [System.IO.Path]::DirectorySeparatorChar
+    }
+
+    return $fullPath.StartsWith($fullBase, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Resolve-AllowListScriptPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $AllowListAction
+    )
+
+    if (-not ($AllowListAction.PSObject.Properties.Name -contains 'Path')) {
+        throw "Allowlist action '$($AllowListAction.name)' does not specify Path"
+    }
+
+    $configuredPath = [string]$AllowListAction.Path
+    if ([string]::IsNullOrWhiteSpace($configuredPath)) {
+        throw "Allowlist action '$($AllowListAction.name)' has empty Path"
+    }
+
+    $candidatePath = if ([System.IO.Path]::IsPathRooted($configuredPath)) {
+        $configuredPath
+    }
+    else {
+        Join-Path $script:AllowedScriptsDir $configuredPath
+    }
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($candidatePath)
+    $allowedDir = [System.IO.Path]::GetFullPath($script:AllowedScriptsDir)
+
+    if (-not (Test-PathWithinBaseDirectory -Path $resolvedPath -BaseDirectory $allowedDir)) {
+        throw "Allowlist script path for '$($AllowListAction.name)' escapes allowed scripts directory: $resolvedPath"
+    }
+
+    if ([System.IO.Path]::GetExtension($resolvedPath).ToLowerInvariant() -ne '.ps1') {
+        throw "Allowlist script path for '$($AllowListAction.name)' must point to a .ps1 file"
+    }
+
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+        throw "Allowlist script not found for '$($AllowListAction.name)': $resolvedPath"
+    }
+
+    return $resolvedPath
 }
 
 # ==========================
@@ -453,12 +515,60 @@ function Invoke-AccountAction {
         $execParams['SamAccountName'] = $action.Target.SamAccountName
     }
 
+    $scriptPath = Resolve-AllowListScriptPath -AllowListAction $allowed
+    $actionJsonPath = Join-Path $script:LogDir ("action-{0}-input.json" -f $ActionId)
+    $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $stdoutLogPath = Join-Path $script:LogDir ("action-{0}-{1}.stdout.log" -f $ActionId, $timestamp)
+    $stderrLogPath = Join-Path $script:LogDir ("action-{0}-{1}.stderr.log" -f $ActionId, $timestamp)
+    $combinedLogPath = Join-Path $script:LogDir ("action-{0}-{1}.log" -f $ActionId, $timestamp)
+
+    $actionPayload = [ordered]@{
+        Action = $action
+        Parameters = $execParams
+    }
+    $actionPayload | ConvertTo-Json -Depth 20 | Set-Content -Path $actionJsonPath -Encoding UTF8
+
     try {
-        $scriptBlock = [scriptblock]::Create($allowed.script)
-        $result = & $scriptBlock @execParams
-        $action.Status = 'EXECUTED'
+        $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $scriptPath,
+            '-ActionJson',
+            $actionJsonPath
+        ) -Wait -PassThru -RedirectStandardOutput $stdoutLogPath -RedirectStandardError $stderrLogPath
+
+        $stdoutText = if (Test-Path -LiteralPath $stdoutLogPath) { Get-Content -Path $stdoutLogPath -Raw } else { '' }
+        $stderrText = if (Test-Path -LiteralPath $stderrLogPath) { Get-Content -Path $stderrLogPath -Raw } else { '' }
+        $combinedLog = @(
+            '=== STDOUT ===',
+            $stdoutText,
+            '',
+            '=== STDERR ===',
+            $stderrText
+        ) -join [Environment]::NewLine
+        Set-Content -Path $combinedLogPath -Value $combinedLog -Encoding UTF8
+
+        $exitCode = [int]$process.ExitCode
         $action.ExecutedAt = [DateTime]::UtcNow.ToString('o')
-        $action.Result = $result
+        $action.Result = @{
+            ExitCode = $exitCode
+            LogPath = $combinedLogPath
+        }
+
+        if ($exitCode -eq 0) {
+            $action.Status = 'EXECUTED'
+        }
+        else {
+            $action.Status = 'FAILED'
+            if ($action.Meta -is [hashtable]) {
+                $action.Meta.LastError = "Action script exited with code $exitCode"
+            }
+            Write-EngineLog -Level 'ERROR' -Message 'Account action execution failed' -Context @{ id = $ActionId; exitCode = $exitCode; logPath = $combinedLogPath }
+        }
+
         if ($action.Audit -is [hashtable]) {
             $action.Audit.UpdatedBy = 'Invoke-AccountAction'
         }
@@ -468,6 +578,7 @@ function Invoke-AccountAction {
         $action.ExecutedAt = [DateTime]::UtcNow.ToString('o')
         $action.Result = @{
             Message = $_.Exception.Message
+            LogPath = $combinedLogPath
         }
         if ($action.Meta -is [hashtable]) {
             $action.Meta.LastError = $_.Exception.Message
@@ -475,11 +586,17 @@ function Invoke-AccountAction {
         if ($action.Audit -is [hashtable]) {
             $action.Audit.UpdatedBy = 'Invoke-AccountAction'
         }
-        Write-EngineLog -Level 'ERROR' -Message 'Account action execution failed' -Context @{ id = $ActionId; error = $_.Exception.Message }
+        Write-EngineLog -Level 'ERROR' -Message 'Account action execution failed' -Context @{ id = $ActionId; error = $_.Exception.Message; logPath = $combinedLogPath }
     }
     finally {
         $action.FinishedAt = [DateTime]::UtcNow.ToString('o')
         Save-Action -Action $action | Out-Null
+
+        foreach ($tempLog in @($stdoutLogPath, $stderrLogPath)) {
+            if (Test-Path -LiteralPath $tempLog) {
+                Remove-Item -Path $tempLog -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     Write-EngineLog -Level 'INFO' -Message 'Account action invocation finished' -Context @{ id = $ActionId; status = $action.Status }
