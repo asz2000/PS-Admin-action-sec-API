@@ -1,5 +1,5 @@
 # ActionEngine.psm1
-# Core execution engine for privileged actions
+# Core execution engine for privileged account actions
 # Atomic state handling, allowlist validation, structured logging
 
 Set-StrictMode -Version Latest
@@ -37,6 +37,7 @@ function Write-AtomicFile {
     if (Test-Path $Path) {
         Remove-Item $Path -Force
     }
+
     Move-Item -Path $tmp -Destination $Path -Force
 }
 
@@ -57,7 +58,7 @@ function Write-EngineLog {
         context   = $Context
     }
 
-    $json = ($entry | ConvertTo-Json -Depth 6)
+    $json = ($entry | ConvertTo-Json -Depth 8 -Compress)
     $logFile = Join-Path $script:LogDir "engine.log"
 
     Add-Content -Path $logFile -Value $json
@@ -96,29 +97,46 @@ function Test-AllowListAction {
 # ==========================
 function Get-ActionStatePath {
     param([string] $ActionId)
+
     return Join-Path $script:StateDir "$ActionId.json"
 }
 
-function Save-ActionState {
+function Save-Action {
+    [CmdletBinding()]
     param(
-        [string] $ActionId,
-        [hashtable] $State
+        [Parameter(Mandatory)] [hashtable] $Action
     )
 
-    $path = Get-ActionStatePath $ActionId
-    $json = $State | ConvertTo-Json -Depth 6
+    if (-not $Action.Id) {
+        throw "Action.Id is required"
+    }
+
+    $path = Get-ActionStatePath -ActionId $Action.Id
+    $json = $Action | ConvertTo-Json -Depth 10
     Write-AtomicFile -Path $path -Content $json
+
+    return $Action
 }
 
-function Get-ActionState {
-    param([string] $ActionId)
+function Get-ActionById {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ActionId
+    )
 
-    $path = Get-ActionStatePath $ActionId
+    $path = Get-ActionStatePath -ActionId $ActionId
     if (-not (Test-Path $path)) {
         return $null
     }
 
-    return Get-Content $path -Raw | ConvertFrom-Json
+    $raw = Get-Content -Path $path -Raw | ConvertFrom-Json
+    $json = $raw | ConvertTo-Json -Depth 10
+    return ConvertFrom-Json -InputObject $json -AsHashtable
+}
+
+function Get-AllActionPaths {
+    Get-ChildItem -Path $script:StateDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName
 }
 
 # ==========================
@@ -128,66 +146,202 @@ function New-ActionId {
     return [guid]::NewGuid().ToString()
 }
 
-function Start-Action {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [string] $ActionName,
-        [Parameter()] [hashtable] $Parameters
-    )
-
-    $allowed = Test-AllowListAction -ActionName $ActionName
-
-    $actionId = New-ActionId
-
-    $state = @{
-        id         = $actionId
-        name       = $ActionName
-        status     = "pending"
-        started_at = (Get-Date).ToString("o")
-        finished_at = $null
-        parameters = $Parameters
-        result     = $null
-        error      = $null
-    }
-
-    Save-ActionState -ActionId $actionId -State $state
-    Write-EngineLog -Level "INFO" -Message "Action started" -Context @{ id = $actionId; name = $ActionName }
-
-    try {
-        $state.status = "running"
-        Save-ActionState -ActionId $actionId -State $state
-
-        $scriptBlock = [scriptblock]::Create($allowed.script)
-        $result = & $scriptBlock @Parameters
-
-        $state.status = "success"
-        $state.result = $result
-    }
-    catch {
-        $state.status = "failed"
-        $state.error  = $_.Exception.Message
-        Write-EngineLog -Level "ERROR" -Message "Action failed" -Context @{ id = $actionId; error = $state.error }
-    }
-    finally {
-        $state.finished_at = (Get-Date).ToString("o")
-        Save-ActionState -ActionId $actionId -State $state
-    }
-
-    return $actionId
+function New-RandomToken {
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    return [Convert]::ToBase64String($bytes).TrimEnd('=') -replace '\+', '-' -replace '/', '_'
 }
 
-function Get-ActionStatus {
+function Get-TokenHash {
+    param([Parameter(Mandatory)] [string] $RawToken)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($RawToken)
+        $hash = $sha.ComputeHash($bytes)
+        return [Convert]::ToHexString($hash).ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function New-AccountAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ActionType,
+        [Parameter(Mandatory)] [string] $SamAccountName,
+        [Parameter(Mandatory)] [string] $ResponsibleEmail,
+        [Parameter()] [string] $ResponsibleAdLogin,
+        [Parameter()] [string] $DisplayName,
+        [Parameter()] [string] $Reason,
+        [Parameter()] [hashtable] $Parameters,
+        [Parameter()] [int] $TokenTtlMinutes = 60
+    )
+
+    Test-AllowListAction -ActionName $ActionType | Out-Null
+
+    $actionId = New-ActionId
+    $token = New-RandomToken
+    $utcNow = [DateTime]::UtcNow
+
+    $action = [ordered]@{
+        Id = $actionId
+        TokenHash = (Get-TokenHash -RawToken $token)
+        Status = 'PENDING'
+        ActionType = $ActionType
+        CreatedAt = $utcNow.ToString('o')
+        ConfirmedAt = $null
+        ExecutedAt = $null
+        FinishedAt = $null
+        ExpiresAt = $utcNow.AddMinutes($TokenTtlMinutes).ToString('o')
+        Target = @{
+            SamAccountName = $SamAccountName
+            DisplayName = $DisplayName
+        }
+        Responsible = @{
+            Email = $ResponsibleEmail
+            AdLogin = $ResponsibleAdLogin
+        }
+        Meta = @{
+            Reason = $Reason
+        }
+        Parameters = $Parameters
+        Result = $null
+        Error = $null
+    }
+
+    Save-Action -Action $action | Out-Null
+    Write-EngineLog -Level 'INFO' -Message 'Account action created' -Context @{ id = $actionId; actionType = $ActionType; status = 'PENDING' }
+
+    return @{
+        Id = $actionId
+        Token = $token
+        ExpiresAt = $action.ExpiresAt
+        Status = $action.Status
+    }
+}
+
+function Get-AccountActionByToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $RawToken
+    )
+
+    $tokenHash = Get-TokenHash -RawToken $RawToken
+    $utcNow = [DateTime]::UtcNow
+
+    foreach ($path in Get-AllActionPaths) {
+        $action = Get-Content -Path $path -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+        if ($action.TokenHash -ne $tokenHash) {
+            continue
+        }
+
+        if ([datetime]$action.ExpiresAt -lt $utcNow) {
+            throw 'Token expired'
+        }
+
+        if ($action.Status -notin @('PENDING', 'CONFIRMED')) {
+            throw "Action in invalid state '$($action.Status)' for token usage"
+        }
+
+        return $action
+    }
+
+    throw 'Action not found for token'
+}
+
+function Confirm-AccountAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ActionId,
+        [Parameter()] [string] $ConfirmedBy
+    )
+
+    $action = Get-ActionById -ActionId $ActionId
+    if (-not $action) {
+        throw "Unknown action id: $ActionId"
+    }
+
+    if ([datetime]$action.ExpiresAt -lt [DateTime]::UtcNow) {
+        $action.Status = 'CANCELLED'
+        $action.Error = 'Token expired before confirmation'
+        $action.FinishedAt = [DateTime]::UtcNow.ToString('o')
+        Save-Action -Action $action | Out-Null
+        throw 'Action token expired'
+    }
+
+    if ($action.Status -ne 'PENDING') {
+        throw "Cannot confirm action in status '$($action.Status)'"
+    }
+
+    $action.Status = 'CONFIRMED'
+    $action.ConfirmedAt = [DateTime]::UtcNow.ToString('o')
+
+    if ($ConfirmedBy) {
+        $action.Responsible.ConfirmedBy = $ConfirmedBy
+    }
+
+    Save-Action -Action $action | Out-Null
+    Write-EngineLog -Level 'INFO' -Message 'Account action confirmed' -Context @{ id = $ActionId; status = 'CONFIRMED' }
+
+    return $action
+}
+
+function Invoke-AccountAction {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string] $ActionId
     )
 
-    $state = Get-ActionState -ActionId $ActionId
-    if (-not $state) {
+    $action = Get-ActionById -ActionId $ActionId
+    if (-not $action) {
         throw "Unknown action id: $ActionId"
     }
 
-    return $state
+    if ($action.Status -ne 'CONFIRMED') {
+        throw "Cannot execute action in status '$($action.Status)'"
+    }
+
+    $allowed = Test-AllowListAction -ActionName $action.ActionType
+
+    $execParams = @{}
+    if ($action.Parameters -is [hashtable]) {
+        $execParams = $action.Parameters
+    }
+
+    if (-not $execParams.ContainsKey('SamAccountName')) {
+        $execParams['SamAccountName'] = $action.Target.SamAccountName
+    }
+
+    $action.Status = 'EXECUTED'
+    $action.ExecutedAt = [DateTime]::UtcNow.ToString('o')
+
+    try {
+        $scriptBlock = [scriptblock]::Create($allowed.script)
+        $result = & $scriptBlock @execParams
+        $action.Result = $result
+        $action.Error = $null
+    }
+    catch {
+        $action.Status = 'FAILED'
+        $action.Error = $_.Exception.Message
+        Write-EngineLog -Level 'ERROR' -Message 'Account action execution failed' -Context @{ id = $ActionId; error = $action.Error }
+    }
+    finally {
+        $action.FinishedAt = [DateTime]::UtcNow.ToString('o')
+        Save-Action -Action $action | Out-Null
+    }
+
+    Write-EngineLog -Level 'INFO' -Message 'Account action invocation finished' -Context @{ id = $ActionId; status = $action.Status }
+    return $action
 }
 
-Export-ModuleMember -Function *
+Export-ModuleMember -Function @(
+    'New-AccountAction',
+    'Get-AccountActionByToken',
+    'Confirm-AccountAction',
+    'Invoke-AccountAction',
+    'Save-Action',
+    'Get-ActionById'
+)
