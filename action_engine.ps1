@@ -263,11 +263,7 @@ function Confirm-AccountAction {
         throw "Unknown action id: $ActionId"
     }
 
-    if ([datetime]$action.ExpiresAt -lt [DateTime]::UtcNow) {
-        $action.Status = 'CANCELLED'
-        $action.Error = 'Token expired before confirmation'
-        $action.FinishedAt = [DateTime]::UtcNow.ToString('o')
-        Save-Action -Action $action | Out-Null
+    if ([datetime]$action.ExpiresAt -le [DateTime]::UtcNow) {
         throw 'Action token expired'
     }
 
@@ -314,17 +310,20 @@ function Invoke-AccountAction {
         $execParams['SamAccountName'] = $action.Target.SamAccountName
     }
 
-    $action.Status = 'EXECUTED'
-    $action.ExecutedAt = [DateTime]::UtcNow.ToString('o')
-
     try {
         $scriptBlock = [scriptblock]::Create($allowed.script)
         $result = & $scriptBlock @execParams
+        $action.Status = 'EXECUTED'
+        $action.ExecutedAt = [DateTime]::UtcNow.ToString('o')
         $action.Result = $result
         $action.Error = $null
     }
     catch {
         $action.Status = 'FAILED'
+        $action.ExecutedAt = [DateTime]::UtcNow.ToString('o')
+        $action.Result = @{
+            Message = $_.Exception.Message
+        }
         $action.Error = $_.Exception.Message
         Write-EngineLog -Level 'ERROR' -Message 'Account action execution failed' -Context @{ id = $ActionId; error = $action.Error }
     }
