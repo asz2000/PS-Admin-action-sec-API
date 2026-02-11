@@ -25,6 +25,90 @@ Start-PodeServer {
 
     # ---------- Routes ----------
 
+    function Test-AccountActionsAdminAccess {
+        $identity = $WebEvent.Request.User.Identity
+        if (-not $identity -or -not $identity.IsAuthenticated) {
+            Write-PodeJsonResponse -StatusCode 401 -Value @{ error = 'Windows authentication is required' }
+            return $false
+        }
+
+        $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+        if (-not $principal.IsInRole('AccountActionsAdmin')) {
+            Write-PodeJsonResponse -StatusCode 403 -Value @{ error = 'AccountActionsAdmin membership is required' }
+            return $false
+        }
+
+        return $true
+    }
+
+    function ConvertTo-ActionApiResponse {
+        param([hashtable] $Action)
+
+        return [ordered]@{
+            Id = $Action.Id
+            ActionType = $Action.ActionType
+            Status = $Action.Status
+            CreatedAt = $Action.CreatedAt
+            ConfirmedAt = $Action.ConfirmedAt
+            ExecutedAt = $Action.ExecutedAt
+            FinishedAt = $Action.FinishedAt
+            ExpiresAt = $Action.ExpiresAt
+            Target = $Action.Target
+            Responsible = $Action.Responsible
+            Meta = $Action.Meta
+            Result = $Action.Result
+            Audit = $Action.Audit
+        }
+    }
+
+    # GET /api/actions/{id} – action details
+    Add-PodeRoute -Method Get -Path '/api/actions/:id' -ScriptBlock {
+        param($id)
+
+        if (-not (Test-AccountActionsAdminAccess)) {
+            return
+        }
+
+        $action = Get-ActionById -ActionId $id
+        if (-not $action) {
+            Write-PodeJsonResponse -StatusCode 404 -Value @{ error = 'Action not found' }
+            return
+        }
+
+        Write-PodeJsonResponse -Value (ConvertTo-ActionApiResponse -Action $action)
+    }
+
+    # GET /api/actions?status=PENDING – list actions (optional status filter)
+    Add-PodeRoute -Method Get -Path '/api/actions' -ScriptBlock {
+        if (-not (Test-AccountActionsAdminAccess)) {
+            return
+        }
+
+        $statusFilter = $null
+        if ($WebEvent.Query.ContainsKey('status') -and -not [string]::IsNullOrWhiteSpace($WebEvent.Query['status'])) {
+            $statusFilter = $WebEvent.Query['status'].ToUpperInvariant()
+        }
+
+        $actions = @()
+        $actionFiles = Get-ChildItem -Path $ActionsDir -Filter 'action-*.json' -File -ErrorAction SilentlyContinue
+        foreach ($file in $actionFiles) {
+            $actionId = [System.IO.Path]::GetFileNameWithoutExtension($file.Name) -replace '^action-', ''
+            $action = Get-ActionById -ActionId $actionId
+            if (-not $action) {
+                continue
+            }
+
+            if ($statusFilter -and $action.Status.ToUpperInvariant() -ne $statusFilter) {
+                continue
+            }
+
+            $actions += (ConvertTo-ActionApiResponse -Action $action)
+        }
+
+        $orderedActions = $actions | Sort-Object -Property CreatedAt -Descending
+        Write-PodeJsonResponse -Value @{ items = @($orderedActions); count = @($orderedActions).Count }
+    }
+
     # GET /a/{token} – confirmation page
     Add-PodeRoute -Method Get -Path '/a/:token' -ScriptBlock {
         param($token)
