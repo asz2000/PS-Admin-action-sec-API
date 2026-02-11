@@ -147,7 +147,8 @@ function New-ActionId {
 }
 
 function New-RandomToken {
-    $bytes = New-Object byte[] 32
+    $minTokenBytes = 32
+    $bytes = New-Object byte[] $minTokenBytes
     [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
     return [Convert]::ToBase64String($bytes).TrimEnd('=') -replace '\+', '-' -replace '/', '_'
 }
@@ -159,11 +160,33 @@ function Get-TokenHash {
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($RawToken)
         $hash = $sha.ComputeHash($bytes)
-        return [Convert]::ToHexString($hash).ToLowerInvariant()
+        return [Convert]::ToHexString($hash).ToUpperInvariant()
     }
     finally {
         $sha.Dispose()
     }
+}
+
+function Test-FixedTimeEqualsHash {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $LeftHash,
+        [Parameter(Mandatory)] [string] $RightHash
+    )
+
+    $leftBytes = [System.Text.Encoding]::UTF8.GetBytes($LeftHash.ToUpperInvariant())
+    $rightBytes = [System.Text.Encoding]::UTF8.GetBytes($RightHash.ToUpperInvariant())
+
+    $diff = $leftBytes.Length -bxor $rightBytes.Length
+    $maxLength = [Math]::Max($leftBytes.Length, $rightBytes.Length)
+
+    for ($i = 0; $i -lt $maxLength; $i++) {
+        $leftByte = if ($i -lt $leftBytes.Length) { $leftBytes[$i] } else { [byte]0 }
+        $rightByte = if ($i -lt $rightBytes.Length) { $rightBytes[$i] } else { [byte]0 }
+        $diff = $diff -bor ($leftByte -bxor $rightByte)
+    }
+
+    return ($diff -eq 0)
 }
 
 function New-AccountAction {
@@ -214,9 +237,16 @@ function New-AccountAction {
     Save-Action -Action $action | Out-Null
     Write-EngineLog -Level 'INFO' -Message 'Account action created' -Context @{ id = $actionId; actionType = $ActionType; status = 'PENDING' }
 
+    $approveBaseUrl = [Environment]::GetEnvironmentVariable('ACTION_APPROVE_BASE_URL')
+    if ([string]::IsNullOrWhiteSpace($approveBaseUrl)) {
+        $approveBaseUrl = '/a'
+    }
+
+    $approveUrl = '{0}/{1}' -f $approveBaseUrl.TrimEnd('/'), $token
+
     return @{
         Id = $actionId
-        Token = $token
+        ApproveUrl = $approveUrl
         ExpiresAt = $action.ExpiresAt
         Status = $action.Status
     }
@@ -233,7 +263,11 @@ function Get-AccountActionByToken {
 
     foreach ($path in Get-AllActionPaths) {
         $action = Get-Content -Path $path -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
-        if ($action.TokenHash -ne $tokenHash) {
+        if (-not $action.TokenHash) {
+            continue
+        }
+
+        if (-not (Test-FixedTimeEqualsHash -LeftHash $action.TokenHash -RightHash $tokenHash)) {
             continue
         }
 
