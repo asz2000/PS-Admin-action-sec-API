@@ -73,7 +73,13 @@ function Get-AllowList {
         throw "Allowlist file not found: $script:AllowListFile"
     }
 
-    return Get-Content $script:AllowListFile -Raw | ConvertFrom-Json
+    $allowListRaw = Get-Content $script:AllowListFile -Raw | ConvertFrom-Json
+
+    if ($allowListRaw -is [System.Collections.IEnumerable] -and -not ($allowListRaw -is [string])) {
+        return @($allowListRaw)
+    }
+
+    throw "Allowlist format is invalid. Expected a top-level array of actions with Name/Path/AllowedParams"
 }
 
 function Test-AllowListAction {
@@ -84,17 +90,67 @@ function Test-AllowListAction {
 
     $allow = Get-AllowList
 
-    $match = $allow.actions | Where-Object { $_.name -eq $ActionName }
+    $matches = @($allow | Where-Object { $_.Name -eq $ActionName })
 
-    if (-not $match) {
+    if ($matches.Count -eq 0) {
         throw "Action '$ActionName' is not allowed by allowlist"
     }
+
+    if ($matches.Count -gt 1) {
+        throw "Allowlist contains duplicate action entries for '$ActionName'"
+    }
+
+    $match = $matches[0]
 
     if ($match.PSObject.Properties.Name -contains 'script' -and -not [string]::IsNullOrWhiteSpace([string]$match.script)) {
         throw "Action '$ActionName' contains a forbidden inline script definition. Use Path to a .ps1 file."
     }
 
     return $match
+}
+
+function Test-AllowedActionParameters {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $ActionName,
+        [Parameter(Mandatory)] $AllowListAction,
+        [Parameter()] [hashtable] $Parameters
+    )
+
+    if (-not $Parameters) {
+        return
+    }
+
+    $allowedParams = @{}
+    if ($AllowListAction.PSObject.Properties.Name -contains 'AllowedParams' -and $AllowListAction.AllowedParams -ne $null) {
+        if ($AllowListAction.AllowedParams -is [hashtable]) {
+            $allowedParams = $AllowListAction.AllowedParams
+        }
+        else {
+            $allowedParams = @{}
+            foreach ($property in $AllowListAction.AllowedParams.PSObject.Properties) {
+                $allowedParams[$property.Name] = [string]$property.Value
+            }
+        }
+    }
+
+    foreach ($entry in $Parameters.GetEnumerator()) {
+        $paramName = [string]$entry.Key
+        $paramValue = [string]$entry.Value
+
+        if (-not $allowedParams.ContainsKey($paramName)) {
+            throw "Action '$ActionName' rejects parameter '$paramName': parameter is not declared in AllowedParams"
+        }
+
+        $pattern = [string]$allowedParams[$paramName]
+        if ([string]::IsNullOrWhiteSpace($pattern)) {
+            throw "Action '$ActionName' has invalid AllowedParams rule for '$paramName': regex must not be empty"
+        }
+
+        if ($paramValue -notmatch $pattern) {
+            throw "Action '$ActionName' rejects parameter '$paramName': value '$paramValue' does not match regex '$pattern'"
+        }
+    }
 }
 
 function Test-PathWithinBaseDirectory {
@@ -121,12 +177,12 @@ function Resolve-AllowListScriptPath {
     )
 
     if (-not ($AllowListAction.PSObject.Properties.Name -contains 'Path')) {
-        throw "Allowlist action '$($AllowListAction.name)' does not specify Path"
+        throw "Allowlist action '$($AllowListAction.Name)' does not specify Path"
     }
 
     $configuredPath = [string]$AllowListAction.Path
     if ([string]::IsNullOrWhiteSpace($configuredPath)) {
-        throw "Allowlist action '$($AllowListAction.name)' has empty Path"
+        throw "Allowlist action '$($AllowListAction.Name)' has empty Path"
     }
 
     $candidatePath = if ([System.IO.Path]::IsPathRooted($configuredPath)) {
@@ -140,15 +196,15 @@ function Resolve-AllowListScriptPath {
     $allowedDir = [System.IO.Path]::GetFullPath($script:AllowedScriptsDir)
 
     if (-not (Test-PathWithinBaseDirectory -Path $resolvedPath -BaseDirectory $allowedDir)) {
-        throw "Allowlist script path for '$($AllowListAction.name)' escapes allowed scripts directory: $resolvedPath"
+        throw "Allowlist script path for '$($AllowListAction.Name)' escapes allowed scripts directory: $resolvedPath"
     }
 
     if ([System.IO.Path]::GetExtension($resolvedPath).ToLowerInvariant() -ne '.ps1') {
-        throw "Allowlist script path for '$($AllowListAction.name)' must point to a .ps1 file"
+        throw "Allowlist script path for '$($AllowListAction.Name)' must point to a .ps1 file"
     }
 
     if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
-        throw "Allowlist script not found for '$($AllowListAction.name)': $resolvedPath"
+        throw "Allowlist script not found for '$($AllowListAction.Name)': $resolvedPath"
     }
 
     return $resolvedPath
@@ -369,7 +425,8 @@ function New-AccountAction {
         [Parameter()] [int] $TokenTtlMinutes = 60
     )
 
-    Test-AllowListAction -ActionName $ActionType | Out-Null
+    $allowedAction = Test-AllowListAction -ActionName $ActionType
+    Test-AllowedActionParameters -ActionName $ActionType -AllowListAction $allowedAction -Parameters $Parameters
 
     $actionId = New-ActionId
     $token = New-RandomToken
@@ -514,6 +571,8 @@ function Invoke-AccountAction {
     if (-not $execParams.ContainsKey('SamAccountName')) {
         $execParams['SamAccountName'] = $action.Target.SamAccountName
     }
+
+    Test-AllowedActionParameters -ActionName $action.ActionType -AllowListAction $allowed -Parameters $execParams
 
     $scriptPath = Resolve-AllowListScriptPath -AllowListAction $allowed
     $actionJsonPath = Join-Path $script:LogDir ("action-{0}-input.json" -f $ActionId)
