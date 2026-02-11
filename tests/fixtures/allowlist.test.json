@@ -1,0 +1,9 @@
+[
+  {
+    "Name": "ResetPassword",
+    "Path": "reset_password.ps1",
+    "AllowedParams": {
+      "SamAccountName": "^[a-zA-Z0-9._-]{3,64}$"
+    }
+  }
+]
